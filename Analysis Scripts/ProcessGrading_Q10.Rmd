@@ -1,0 +1,517 @@
+---
+title: "Process Grading"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(rstatix)
+```
+```{r}
+#Data <- list()
+#Funs <- list()
+#Results <- list()
+```
+
+## Data processing functions here
+
+```{r}
+#Global Variable
+nRubricItem = 3
+```
+
+
+```{r}
+Funs$Prep_input <- function(inputdf, prompt_style, promptShort, humandf){
+  gradeCol_long = str_c(prompt_style, "_grade")
+  gradeCol_short = str_c(promptShort, "_grade")
+  inputdf %>% 
+    select("student", "response", !!str_c(prompt_style, "_text"), {{gradeCol_long}}) %>%
+    mutate("{promptShort}_grade" := Funs$str_to_int(.data[[gradeCol_long]])) %>%
+    Funs$Compare_machine_human(machine_grade_col = gradeCol_short, human_df = humandf)
+}
+```
+
+
+```{r}
+Funs$str_to_int <- function(vecStr){
+  vecStr %>% 
+    str_remove_all("[{}\\s]+") %>% #remove white spaces, this probably won't happen
+    str_split(",") %>% #split into three sub-strings
+    map(as.integer) #turn into a list of integer vectors
+}
+
+# Definition of simple matching distance
+Funs$Calc_SMD <- function(vec1, vec2){
+  if (length(vec1) != length(vec2)) {
+    return(NA_real_)
+  }
+  # Count matching positions
+  matches <- sum(vec1 == vec2)
+  # Total number of elements
+  total_elements <- length(vec1)
+  # Calculate Simple Matching Coefficient (SMC)
+  smc <- matches / total_elements
+  # Return Simple Matching Distance
+  return(1 - smc)  
+}
+
+Funs$Calc_SMD_Vec <- function(gradingVec1, gradingVec2){
+  map2_dbl(gradingVec1, gradingVec2, \(x,y) Funs$Calc_SMD(x, y))
+}
+
+Funs$Calc_QWK <- function(gradingVec1, gradingVec2){
+  rating1 <- map_int(gradingVec1, sum)
+  rating2 <- map_int(gradingVec2, sum)
+  Metrics::ScoreQuadraticWeightedKappa(rating1, rating2)
+}
+
+#Get simple matching distance for each human grader
+Funs$Compare_machine_human <- function(machine_df, machine_grade_col, human_df = Data$human_gradeing){
+  machine_df %>%
+    left_join(human_df, by = c("student")) %>%
+    #left_join(human_df %>% select(-response), by = c("student")) %>%
+    #The response column may have slightly different line return characters when import/exported multiple times in python. "response" was a safty measure anyways and no necessary.
+    #left_join(human_df, by = c("student", "response")) %>% 
+    mutate(
+      h1_SMD = Funs$Calc_SMD_Vec(human1, .data[[machine_grade_col]]),
+      h2_SMD = Funs$Calc_SMD_Vec(human2, .data[[machine_grade_col]]),
+      diff_both = (h1_SMD > 0 & h2_SMD > 0),
+      diff_one = (h1_SMD > 0 | h2_SMD >0)
+    )
+}
+
+#Calculate F1 score for prediction
+## Calculate F1 score for one rubric item
+Funs$Calc_single_F1 <- function(item, grade_AI, grade_human){
+  score_AI = grade_AI %>% map_int(~.[[item]])
+  score_Human = grade_human %>% map_int(~.[[item]])
+  MLmetrics::F1_Score(y_true = score_Human, y_pred = score_AI)
+}
+
+## Calculate Macro F1 score (mean) for all three rubrics.
+
+Funs$Calc_Macro_F1 <- function(grade_AI, grade_human, nRubric = nRubricItem){
+  F1_scores = tibble("item" = c(1:nRubric))
+  F1_scores %>% mutate(
+    F1 = map_dbl(item, ~Funs$Calc_single_F1(., grade_AI = grade_AI, grade_human = grade_human))
+  ) %>% {mean(.$F1)}
+}
+
+#Summarize matching percentages, QWK, Macro F1, and fraction of cases when AI disagree with both humans by the same amount
+Funs$Summarize_Compare <- function(compareOutcome, machine_grade_col, SMDCols = ends_with("SMD")){
+  compareOutcome %>% summarise(
+    across(all_of(SMDCols), list(avg_SMD = mean, frac_match = \(x) sum(x == 0)/length(x))),
+    QWK_h1 = Funs$Calc_QWK(human1, {{machine_grade_col}}),
+    QWK_h2 = Funs$Calc_QWK(human2, {{machine_grade_col}}),
+    QWK_avg = mean(c(QWK_h1,QWK_h2)),
+    Macro_F1_h1 =  Funs$Calc_Macro_F1(human1, {{machine_grade_col}}),
+    Macro_F1_h2 =  Funs$Calc_Macro_F1(human2, {{machine_grade_col}}),
+    Macro_F1_Avg = mean(c(Macro_F1_h1,Macro_F1_h2)),
+    diff_both_human = (sum(diff_both)/length(diff_both)) %>% round(3)
+  ) %>% 
+    relocate(matches("_h[12]$"), .after = "diff_both_human")
+}
+
+```
+
+```{r}
+## This is to make the human gradings visible for manual comparison
+Funs$View_grades <- function(processed_gradeDf, promptType){
+  processed_gradeDf %>%
+    select(student, response, str_c(promptType, "_text"), str_c(promptType, "_grade"), starts_with("human")) %>%
+    mutate(across(starts_with("human"), .fns = \(x) map_chr(x, \(x) str_c(x, collapse = ","))))
+}
+```
+
+```{r}
+#This is used to evaluate the outcomes of self-consistency runs
+Funs$Evaluate_SC <- function(SC_df, entropy_cutoff = 0, case_col = diff_both){
+  SC_df %>% mutate(Test = as_factor(entropy > entropy_cutoff), Case = as_factor({{case_col}})) %>% 
+    {caret::confusionMatrix(.$Test, .$Case, positive = "TRUE")} -> cfMatrix
+  
+  cfMatrix %>% broom::tidy() %>% #use the caret package for confusion Matrix, and broom to clean the output.
+    mutate(estimate = round(estimate, 3)) %>% select(term, estimate) %>% filter(term %in% c("accuracy", "sensitivity", "specificity", "precision", "f1")) %>% #select necessary outputs
+    pivot_wider(names_from = "term", values_from = "estimate") %>% mutate(across(-"f1", scales::label_percent(0.1))) %>% #transform into a wide table and turn decimals into percentages.label_percent returns a function with the given level of precision and other parameters.
+    rename(`sensitivity(recall)` = sensitivity) %>%
+    mutate(
+      entropy = str_c(">", entropy_cutoff),
+      need_review = (rowSums(cfMatrix$table)[[2]]/sum(cfMatrix$table)) %>% scales::label_percent(0.1)(),
+      .before = accuracy
+    ) 
+}
+```
+
+## Load the human grading data
+```{r}
+Data$human_gradeing_Q10 <- readRDS("../data/human_grading_Q10.Rds")
+```
+
+```{r}
+Data$human_gradeing_Q10 %>% rename(student = studentId) -> Data$human_gradeing_Q10
+```
+
+
+## human to human baseline
+
+```{r}
+Data$human_gradeing_Q10 %>% mutate(
+  humanSMD = Funs$Calc_SMD_Vec(human1, human2)
+) -> Data$human_gradeing_Q10_SMD
+
+Results$human_baseline_Q10 <- Data$human_gradeing_Q10_SMD %>% summarise(
+    avg_SMD = mean(humanSMD), 
+    frac_match =  sum(humanSMD == 0)/length(humanSMD),
+    QWK = Funs$Calc_QWK(human1, human2),
+    F1 = Funs$Calc_Macro_F1(human1, human2)
+  )
+```
+
+```{r}
+Results$human_baseline_Q10
+```
+
+## Load machine grading data
+
+```{r}
+#Data$gpt35 <- list()
+#Data$gpt4 <- list()
+```
+
+```{r}
+#Data$gpt35$Q10 <- list()
+#Data$gpt4$Q10 <- list()
+```
+
+
+### GPT 3.5
+```{r}
+Data$gpt35$Q10$grading <- read_csv("./Final_Q10/full_grading_gpt35.csv", show_col_types = F)
+```
+```{r}
+Data$gpt35$Q10$grading %>% rename(student = studentId) %>% select(-1) -> Data$gpt35$Q10$grading
+```
+
+
+```{r}
+Data$gpt35$Q10$grading %>% Funs$Prep_input("naive_cot_2", "nct2", humandf = Data$human_gradeing_Q10) -> Data$gpt35$Q10$nct2_processed
+Data$gpt35$Q10$grading %>% Funs$Prep_input("naive_cot_1", "nct1", humandf = Data$human_gradeing_Q10) -> Data$gpt35$Q10$nct1_processed
+Data$gpt35$Q10$grading %>% Funs$Prep_input("detailed_compare", "dc", humandf = Data$human_gradeing_Q10) -> Data$gpt35$Q10$dc_processed
+Data$gpt35$Q10$grading %>% Funs$Prep_input("forced_compare", "fc", humandf = Data$human_gradeing_Q10) -> Data$gpt35$Q10$fc_processed
+```
+
+
+
+### GPT 4o
+```{r}
+#Data$gpt4$test_15 = read_csv("./test_grading_gpt4.csv", show_col_types = F)
+Data$gpt4$Q10$grading <- read_csv("./Final_Q10/full_grading_gpt4o.csv", show_col_types = F)
+```
+```{r}
+Data$gpt4$Q10$grading %>% rename(student = studentId) %>% select(-1) -> Data$gpt4$Q10$grading
+```
+
+
+```{r}
+#Data$gpt4$test_15 %>% Funs$Prep_input("naive_cot_2", "nct2") -> Data$gpt4$test_15_processed
+Data$gpt4$Q10$grading %>% Funs$Prep_input("naive_cot_2", "nct2", humandf = Data$human_gradeing_Q10) -> Data$gpt4$Q10$nct2_processed
+Data$gpt4$Q10$grading %>% Funs$Prep_input("naive_cot_1", "nct1", humandf = Data$human_gradeing_Q10) -> Data$gpt4$Q10$nct1_processed
+Data$gpt4$Q10$grading %>% Funs$Prep_input("detailed_compare", "dc", humandf = Data$human_gradeing_Q10) -> Data$gpt4$Q10$dc_processed
+Data$gpt4$Q10$grading %>% Funs$Prep_input("forced_compare", "fc", humandf = Data$human_gradeing_Q10) -> Data$gpt4$Q10$fc_processed
+Data$gpt4$Q10$grading %>% Funs$Prep_input("detailed_compare_2", "dc2", humandf = Data$human_gradeing_Q10) -> Data$gpt4$Q10$dc2_processed
+```
+
+
+## Compare with both humans and summarize
+
+```{r}
+#Results <- list(
+#  gpt35 = list(),
+#  gpt4 = list()
+#)
+```
+
+```{r}
+#Results$gpt35$Q10 <- list()
+#Results$gpt4$Q10 <- list()
+```
+
+
+
+### GPT-35 results
+
+Naive COT with simple rubric
+```{r}
+Results$gpt35$Q10$nct1_Summary <- Data$gpt35$Q10$nct1_processed %>% Funs$Summarize_Compare(machine_grade_col = nct1_grade)
+Results$gpt35$Q10$nct1_Summary
+```
+
+Naive COT with detailed rubric
+```{r}
+Results$gpt35$Q10$nct2_Summary <- Data$gpt35$Q10$nct2_processed %>% Funs$Summarize_Compare(machine_grade_col = nct2_grade)
+Results$gpt35$Q10$nct2_Summary
+```
+
+Detailed compare with detailed rubric
+
+```{r}
+Results$gpt35$Q10$dc_Summary <- Data$gpt35$Q10$nct2_processed %>% Funs$Summarize_Compare(machine_grade_col = nct2_grade)
+Results$gpt35$Q10$dc_Summary
+```
+
+
+Forced compare with detailed rubric
+```{r}
+Results$gpt35$Q10$fc_Summary <- Data$gpt35$Q10$fc_processed %>% Funs$Summarize_Compare(machine_grade_col = fc_grade)
+Results$gpt35$Q10$fc_Summary
+```
+
+
+### GPT-4o Results
+
+## Naive CoT with detailed rubric item and gpt-4o model
+```{r}
+Data$gpt4$Q10$nct1_processed %>% Funs$Summarize_Compare(machine_grade_col = nct1_grade) -> Results$gpt4$Q10$nct1_Summary
+
+Results$gpt4$Q10$nct1_Summary
+```
+
+```{r}
+Data$gpt4$Q10$nct2_processed %>% Funs$Summarize_Compare(machine_grade_col = nct2_grade) -> Results$gpt4$Q10$nct2_Summary
+
+Results$gpt4$Q10$nct2_Summary
+```
+
+```{r}
+Data$gpt4$Q10$dc_processed %>% Funs$Summarize_Compare(machine_grade_col = dc_grade) -> Results$gpt4$Q10$dc_Summary
+
+Results$gpt4$Q10$dc_Summary
+```
+```{r}
+Data$gpt4$Q10$fc_processed %>% Funs$Summarize_Compare(machine_grade_col = fc_grade) -> Results$gpt4$Q10$fc_Summary
+
+Results$gpt4$Q10$fc_Summary
+```
+
+```{r}
+Data$gpt4$Q10$dc2_processed %>% Funs$Summarize_Compare(machine_grade_col = dc2_grade) -> Results$gpt4$Q10$dc2_Summary
+
+Results$gpt4$Q10$dc2_Summary
+```
+
+This is awesome, but can AI agree with either humans more than the human graders agree with each other? Yes, the theoretical minimum is diff_both_human = 0, and p + (1-p)/2, which means that the AI always sides with one of the human raters. Here, human raters agree 74%, so the theoretical limit is 74 + 13 = 87%. GPT agrees with humans 80% of the time. Only differing with both humans in 10% of the cases.
+
+
+Compare to human baseline;
+```{r}
+Results$human_baseline_Q10
+```
+
+
+```{r}
+Data$gpt4$Q10$dc_processed %>% filter(diff_both) %>% write_csv("./Final_Q10/GPT_4o_diffBoth.csv")
+```
+
+
+#Process self_consistency grading
+
+```{r}
+#Process Raw Grades from Multiple Runs
+Funs$Organize_grades <- function(rawData, colEnding = "_grade"){
+  rawData %>% select(student, ends_with("_grade")) %>% #extract only the grading column.
+    pivot_longer(cols = ends_with("_grade"), names_to = "runs", values_to = "score") %>% #make it a long table
+    mutate(runs = str_extract(runs, "(?<=run_)\\d")) #simplify "runs" into just the number.
+}
+
+#The output is a list with two dataframes
+Funs$Process_grades <- function(processedData){
+  rslt <- list()
+  maxRun = processedData[["runs"]] %>% as.integer() %>% max()
+  rslt$score_freq <- processedData %>% group_by(student) %>%
+    count(score, name = "freq") %>% arrange(student, desc(freq)) #need to arrange by descending frequency
+  rslt$score_consistency <- rslt$score_freq %>%
+    summarise(mode_score = score[[1]], #the most frequent score
+              variety = length(freq),  #the number of different scores
+              entropy = -(sum(freq/maxRun*log(freq/maxRun,base = 2))/log(maxRun,2)) %>% round(2)) %>% #normalized Shannon Entropy of score.
+    arrange(desc(entropy))
+  return(rslt)
+}
+```
+
+
+```{r}
+#Data$gpt4$self_consistency <- list()
+```
+
+```{r}
+#Data$gpt4$Q10$self_consistency_2 <- list()
+```
+
+```{r}
+Data$gpt4$Q10$self_consistency_raw <- read_csv("./Final_Q10/self_consistency_grading.csv")
+Data$gpt4$Q10$self_consistency_raw %>% select(studentId, response, outcome, !contains("detailed_compare_2")) %>% rename(student = studentId) -> Data$gpt4$Q10$self_consistency$raw
+Data$gpt4$Q10$self_consistency_raw %>% select(studentId, response, outcome, contains("detailed_compare_2")) %>% rename(student = studentId) -> Data$gpt4$Q10$self_consistency_2$raw
+
+```
+
+
+```{r}
+#Note this line of code is no longer needed since I updated self_consistency_grading.csv.
+#Data$gpt4$Q10$self_consistency$raw <- read_csv("./Final_Q10/self_consistency_grading.csv")
+```
+```{r}
+Data$gpt4$Q10$self_consistency$raw %>% Funs$Organize_grades() %>%
+  Funs$Process_grades() -> Results$gpt4$Q10$self_consistency
+```
+
+
+
+```{r}
+Results$gpt4$Q10$self_consistency$score_consistency %>% 
+  mutate(mode_score = Funs$str_to_int(mode_score)) %>%
+  Funs$Compare_machine_human(machine_grade_col = "mode_score", human_df = Data$human_gradeing_Q10) -> Results$gpt4$Q10$sc_compare
+```
+
+```{r}
+Results$gpt4$Q10$sc_compare %>% Funs$Evaluate_SC_multi(c(0, 0.4)) -> Results$gpt4$Q10$self_consistency$sc_test_summary
+Results$gpt4$Q10$self_consistency$sc_test_summary
+```
+
+
+```{r}
+Results$gpt4$Q10$sc_compare %>% Funs$Summarize_Compare(machine_grade_col = mode_score) -> Results$gpt4$Q10$sc_summary
+Results$gpt4$Q10$sc_summary
+```
+
+```{r}
+Results$gpt4$Q10$sc_compare %>% filter(h1_SMD > 0, h2_SMD > 0)
+```
+
+```{r}
+Results$gpt4$Q10$sc_compare %>% count(entropy > 0)
+```
+
+
+```{r}
+#Results$gpt4$self_consistency %>% count(entropy > 0)
+#Results$gpt4$self_consistency %>% filter(entropy > 0) %>% count(h1_SMD > 0 | h2_SMD > 0)
+Results$gpt4$Q10$sc_compare %>% filter(entropy <0.4, h1_SMD > 0, h2_SMD > 0) %>% select(student, variety, mode_score) %>% left_join(Data$gpt4$Q10$dc_processed, by = "student") %>% select(student, variety, response, detailed_compare_grade, mode_score, detailed_compare_text) %>% mutate(mode_score = map_chr(mode_score, ~str_flatten_comma(.))) %>% write_csv("./Final_Q10/diff_both_low_entropy.csv")
+```
+
+```{r}
+Data$gpt4$Q10$self_consistency_2$raw %>% Funs$Organize_grades() %>%
+  Funs$Process_grades() -> Results$gpt4$Q10$self_consistency_2
+```
+
+```{r}
+Results$gpt4$Q10$self_consistency_2$score_consistency %>% 
+  mutate(mode_score = Funs$str_to_int(mode_score)) %>%
+  Funs$Compare_machine_human(machine_grade_col = "mode_score", human_df = Data$human_gradeing_Q10) -> Results$gpt4$Q10$sc_2_compare
+```
+
+```{r}
+Results$gpt4$Q10$sc_2_compare %>% Funs$Summarize_Compare(machine_grade_col = mode_score) -> Results$gpt4$Q10$sc_2_summary
+Results$gpt4$Q10$sc_2_summary
+```
+```{r}
+Results$gpt4$Q10$sc_2_compare %>% Funs$Evaluate_SC(entropy_cutoff = 0)
+```
+
+
+```{r}
+Results$gpt4$Q10$sc_2_compare %>% Funs$Evaluate_SC(entropy_cutoff = 0.4)
+```
+
+
+```{r}
+Results$gpt4$Q10$sc_2_compare %>% filter(h1_SMD > 0, h2_SMD > 0)
+```
+
+```{r}
+Results$gpt4$Q10$sc_2_compare %>% filter(h1_SMD > 0, h2_SMD > 0) %>% select(student, variety, mode_score) %>% left_join(Data$gpt4$Q10$dc2_processed, by = "student") %>% select(student, variety, response, detailed_compare_2_grade, mode_score, detailed_compare_2_text) %>% mutate(mode_score = map_chr(mode_score, ~str_flatten_comma(.))) %>% write_csv("./Final_Q10/diff_both_low_entropy_2.csv")
+```
+
+
+
+```{r}
+Results$gpt4$Q10$sc_2_compare %>% filter(entropy > 0)
+```
+
+
+
+
+
+
+
+
+Accuracy: $\frac{TP + TN}{TP+TN+FP+FN}$ Correctly identified cases among all cases (but this is highly umbalanced)
+Sensitivity (same as recall): $\frac{TP}{TP + FN}$ Correctly identified positive among all positive cases. (most relevant)
+Specificity: $\frac{TN}{TN + FP}$ Correctly classified negative cases among all negative cases. 
+Precision: $\frac{TP}{TP+FP}$ Correctly identified positives among all identified cases. (how efficient is the test)
+
+```{r}
+Results$gpt4$Q10$sc_compare %>% Funs$Evaluate_SC(entropy_cutoff = 0, case_col = diff_both)
+```
+```{r}
+Results$gpt4$Q10$sc_compare %>% Funs$Evaluate_SC(entropy_cutoff = 0.4, case_col = diff_both)
+```
+
+
+
+```{r}
+Results$gpt4$Q10$sc_2_compare %>% Funs$Evaluate_SC_multi(c(0, 0.4)) -> Results$gpt4$Q10$self_consistency_2$sc_test_summary
+Results$gpt4$Q10$self_consistency_2$sc_test_summary
+```
+
+
+## Need to write function to calculate the summary for all 5 runs, and compare the results to the self-consistency outcome. 
+
+
+```{r}
+Funs$Sum_oneRun <- function(runName, promptStyle, grading_df, humandf){
+  #prepare the proper column names for summary functions
+  runColName = str_c(promptStyle, "_", runName)
+  runRsltName = str_c(runName, "_grade")
+  #invoke the summary functions and make some modifications
+  grading_df %>% Funs$Prep_input(runColName, runName, humandf = humandf) %>%
+    Funs$Summarize_Compare(.[[runRsltName]]) %>% select(-matches("_h[12]$")) %>%
+    pivot_longer(everything(),names_to = "data_type", values_to = "value") %>%
+    mutate(value = round(value, 2))
+}
+
+Funs$Sum_multiRuns <- function(grading_df, promptStyle, human_df, nRuns = 5){
+  outputTbl <- tibble(runs = paste0("run_", c(1:nRuns)))
+  outputTbl %>% mutate(summary = map(runs, ~Funs$Sum_oneRun(.,promptStyle, grading_df, humandf = human_df))) %>% 
+    unnest(summary) %>% 
+    group_by(data_type) %>% summarise(mean = mean(value), min = min(value), max = max(value))
+}
+```
+
+```{r}
+Data$gpt4$Q10$self_consistency$raw %>% Funs$Sum_multiRuns(promptStyle = "detailed_compare", human_df = Data$human_gradeing_Q10) -> Results$gpt4$Q10$self_consistency$outcome_summary
+Results$gpt4$Q10$self_consistency$outcome_summary
+```
+
+```{r}
+Data$gpt4$Q10$self_consistency_2$raw %>% Funs$Sum_multiRuns(promptStyle = "detailed_compare_2", human_df = Data$human_gradeing_Q10) -> Results$gpt4$Q10$self_consistency_2$outcome_summary
+Results$gpt4$Q10$self_consistency_2$outcome_summary
+```
+
+
+# Note: The standardized analysis process:
+1. Run each of the four prompts for each model once. 
+
+2. Select the top performing model, run it five times.
+
+The five runs serves 3 functions:
+
+1. Check the stability of grading outcomes.
+
+2. Test if using the most frequent grading of the five runs result in better performance.
+
+3. Test if the AI grading that has more variability between different runs can be used as a measure of low AI confidence and inform human supervisor. 
+
+
+
+
