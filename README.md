@@ -15,9 +15,8 @@ In the paper, the three questions are referred to as Q1, Q2 and Q3. In the analy
        - Grading_Final_Q8: This grades Question 3, the third question in the paper.
     * Utilities:
       - calc_price.py: Function to help calculate the cost of each grading action based on the model and publicly available cost information
-      - pickle_tools.py: GPT connection objects cannot be pickled and stored, unfortunately. So I wrote this script to pickle a list of python objects by name, excluding the objects that involves communication with Azure, and then restored it upon re-run. Super useful for code development.
-      - print_response.py: (to be written)
-      - binary_output.py:
-      - QuestionInfo.py:  
+      - pickle_tools.py: GPT connection objects cannot be serialized (pickled) and stored, unfortunately. So the common "dill" package will bug out when trying to store custom objects. I wrote those functions to pickle a list of python objects by name, excluding the objects that involve Azure communication, and then restored the saved objects automatically after opening a new session. Super useful for code development over a period of time.
+      - print_response.py: functions to print GPT response
+      - binary_output.py: functions to extract grading output such as "{1,0,1}" from the GPT grading response.
 3. 
 

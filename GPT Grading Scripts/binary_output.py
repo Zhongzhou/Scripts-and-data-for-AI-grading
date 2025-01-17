@@ -15,7 +15,7 @@ def Create_Search(n:int):
     return full_pattern
 
 
-#extracts a binary vectory and excludes all the 
+#extracts a binary vector from text and excludes all the white spaces
 def Extract_binary(text, nItems):
     match = re.search(Create_Search(nItems), text)
     if match:
