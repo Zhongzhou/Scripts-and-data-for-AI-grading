@@ -25,3 +25,6 @@ In the paper, the three questions are referred to as Q1, Q2 and Q3. In the analy
     * Data_With_Response.RDS: Those only contain data from students who consented to sharing their de-identified responses publicly for research purposes. 
     * Data_without_Responses.RDS: Those contain all data but with all the student responses removed. Those can be used to check and reproduce the statistical analysis conducted in the study.
 
+## Note for GPT grading:
+
+You will need your own GenAI service subscription such as OpenAI or Azure OpenAI, stored as environmental variable. 
