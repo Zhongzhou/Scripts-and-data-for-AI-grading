@@ -24,6 +24,7 @@ In the paper, the three questions are referred to as Q1, Q2 and Q3. In the analy
 3. **Data:** Sample Data used in this study.
     * Data_With_Response.RDS: Those only contain data from students who consented to sharing their de-identified responses publicly for research purposes. 
     * Data_without_Responses.RDS: Those contain all data but with all the student responses removed. Those can be used to check and reproduce the statistical analysis conducted in the study.
+    * CSV files: Each file contains all student responses (with student consent for public sharing) and the grading output of *GPT-4o* under each prompt-style tested.
 
 ## Note for GPT grading:
 
